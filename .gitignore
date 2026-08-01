@@ -1,0 +1,16 @@
+# Binário compilado
+http-server
+server
+
+# Objetos e artefatos de build
+*.o
+*.out
+
+# Config de IDE
+.idea/
+.vscode/
+
+# Ambiente e segredos (boas práticas de segurança)
+.env
+*.pem
+*.key
