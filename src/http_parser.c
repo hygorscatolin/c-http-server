@@ -1,6 +1,7 @@
 #include "http_parser.h"
 
 #include <string.h>
+#include <strings.h> /* strncasecmp: header names and Connection tokens are case-insensitive, RFC 7230 3.2/6.1 */
 
 static int is_method_char(unsigned char c) {
     /* Real methods are uppercase tokens by convention (GET, POST, ...).
@@ -55,16 +56,59 @@ static http_method_t classify_method(const char *m, size_t len) {
     return HTTP_METHOD_OTHER;
 }
 
+static bool header_name_is(const http_request_parser_t *p, const char *name) {
+    size_t len = strlen(name);
+    return p->header_name_len == len && strncasecmp(p->header_line, name, len) == 0;
+}
+
+/* Called right after a header line completes, if its name is
+ * "Connection". Scans the value as a comma-separated list of tokens
+ * (RFC 7230 section 6.1, e.g. "keep-alive" or, in principle,
+ * "close, foo") and records whichever of "close" / "keep-alive" it
+ * finds. A client sending both is nonsensical, but rather than guess
+ * which one is "right" we just let the last recognized token in the
+ * list win, matching how real parsers typically process repeated or
+ * conflicting directives. */
+static void note_connection_header(http_request_parser_t *p) {
+    const char *value = p->header_line + p->header_name_len;
+    const char *cursor = value;
+
+    while (*cursor != '\0') {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == ',') {
+            cursor++;
+        }
+        if (*cursor == '\0') {
+            break;
+        }
+        const char *tok_start = cursor;
+        while (*cursor != '\0' && *cursor != ',') {
+            cursor++;
+        }
+        const char *tok_end = cursor;
+        while (tok_end > tok_start && (tok_end[-1] == ' ' || tok_end[-1] == '\t')) {
+            tok_end--;
+        }
+        size_t tok_len = (size_t)(tok_end - tok_start);
+        if (tok_len == 5 && strncasecmp(tok_start, "close", 5) == 0) {
+            p->connection_directive = HTTP_CONN_CLOSE;
+        } else if (tok_len == 10 && strncasecmp(tok_start, "keep-alive", 10) == 0) {
+            p->connection_directive = HTTP_CONN_KEEPALIVE;
+        }
+    }
+}
+
 void http_parser_init(http_request_parser_t *parser) {
     memset(parser, 0, sizeof(*parser));
     parser->state = HTTP_STATE_METHOD;
 }
 
-http_parse_result_t http_parser_execute(http_request_parser_t *p, const char *data, size_t len) {
+http_parse_result_t http_parser_execute(http_request_parser_t *p, const char *data, size_t len, size_t *consumed) {
     if (p->state == HTTP_STATE_DONE) {
+        *consumed = 0;
         return HTTP_PARSE_COMPLETE;
     }
     if (p->state == HTTP_STATE_ERROR) {
+        *consumed = 0;
         return HTTP_PARSE_ERROR;
     }
 
@@ -119,6 +163,10 @@ http_parse_result_t http_parser_execute(http_request_parser_t *p, const char *da
                     p->state = HTTP_STATE_ERROR;
                     break;
                 }
+                /* is_valid_version already confirmed this exact layout,
+                 * "HTTP/" DIGIT "." DIGIT, so indexing straight in is safe. */
+                p->http_major = p->version[5] - '0';
+                p->http_minor = p->version[7] - '0';
                 p->state = HTTP_STATE_REQUEST_LINE_LF;
             } else if (c >= 0x21 && c <= 0x7E) {
                 if (p->version_len >= sizeof(p->version) - 1) {
@@ -206,6 +254,9 @@ http_parse_result_t http_parser_execute(http_request_parser_t *p, const char *da
 
         case HTTP_STATE_HEADER_LF:
             if (c == '\n') {
+                if (header_name_is(p, "Connection")) {
+                    note_connection_header(p);
+                }
                 p->header_count++;
                 p->state = HTTP_STATE_HEADER_LINE_START;
             } else {
@@ -229,16 +280,31 @@ http_parse_result_t http_parser_execute(http_request_parser_t *p, const char *da
         }
 
         if (p->state == HTTP_STATE_ERROR) {
+            *consumed = i;
             return HTTP_PARSE_ERROR;
         }
         if (p->state == HTTP_STATE_DONE) {
-            /* Any bytes left in data[i..len) belong to a pipelined
-             * request or a body, neither of which this layer handles.
-             * The caller is expected to drain and discard them before
-             * closing the socket, see event_loop.c for why that matters. */
+            /* Any bytes left in data[i..len) belong to whatever comes
+             * next on this connection: a pipelined request if the caller
+             * supports keep-alive, or a body this layer still doesn't
+             * parse. *consumed tells the caller exactly where this
+             * request ended so it can feed the remainder to a freshly
+             * reset parser instead of losing or misparsing it. */
+            *consumed = i;
             return HTTP_PARSE_COMPLETE;
         }
     }
 
+    *consumed = len;
     return HTTP_PARSE_INCOMPLETE;
+}
+
+bool http_parser_should_keep_alive(const http_request_parser_t *p) {
+    if (p->connection_directive == HTTP_CONN_CLOSE) {
+        return false;
+    }
+    if (p->connection_directive == HTTP_CONN_KEEPALIVE) {
+        return true;
+    }
+    return p->http_major == 1 && p->http_minor >= 1;
 }
