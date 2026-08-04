@@ -21,7 +21,13 @@
 /* Canonical document root, everything served must live under it. Filled
  * once by static_files_init() so that no request ever pays for a
  * realpath() of the root, and more importantly so the value a lookup is
- * compared against can't be changed by anything a client sends. */
+ * compared against can't be changed by anything a client sends.
+ *
+ * "Once" is also what makes this module usable from the worker threads
+ * of layer 6 without a lock: main() calls static_files_init() before the
+ * first thread exists, and every lookup afterwards only reads. Nothing
+ * else in here holds state across a call, every working buffer below is
+ * a local, so concurrent static_file_open()s cannot interfere. */
 static char g_root[PATH_MAX];
 static size_t g_root_len;
 
@@ -317,8 +323,11 @@ static_file_result_t static_file_open(const char *path, size_t path_len, static_
 
     /* O_NONBLOCK matters even though it does nothing for regular files:
      * without it, opening a FIFO that happens to sit in the document root
-     * blocks until a writer shows up, which on a single-threaded event
-     * loop means the whole server stops serving everyone. The fstat()
+     * blocks until a writer shows up, and an event loop parked in open()
+     * stops serving every connection it owns. A pool of them softens that
+     * (the other workers keep going) without fixing it: one FIFO per
+     * worker still takes the whole server down, and the loop that blocked
+     * was the only one that could answer its own clients. The fstat()
      * below then rejects it anyway. */
     int fd = open(fs_path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     if (fd < 0) {

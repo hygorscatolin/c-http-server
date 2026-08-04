@@ -82,6 +82,30 @@ typedef struct connection {
     time_t last_activity; /* wall-clock time of the last successful read(), see sweep_idle_connections() */
 } connection_t;
 
+/* All the state one running loop owns. It lives on the stack of whoever
+ * called event_loop_run() and is threaded through every helper below by
+ * pointer, which is what makes layer 6 possible: with N worker threads
+ * each running their own loop, a file-scope static for any of this
+ * (notably the connection list) would be a data race, since two threads
+ * would be splicing the same list on every accept and close.
+ *
+ * Nothing in here is ever shared between loops. Each loop has its own
+ * listen socket (SO_REUSEPORT, see worker_pool.c), its own epoll
+ * instance, its own timer, and its own connections, so no lock is needed
+ * anywhere in this file. */
+typedef struct {
+    int epoll_fd;
+    int listen_fd;
+    int timer_fd;
+    int idle_timeout_seconds;
+    int worker_id;
+
+    /* Head of the live-connection list, used only by the idle-timeout
+     * sweep to enumerate connections epoll itself won't list for us
+     * (epoll_wait only reports ready fds, not the full registered set). */
+    connection_t *connections;
+} event_loop_t;
+
 typedef struct {
     int status;
     const char *reason;
@@ -95,18 +119,15 @@ typedef struct {
     static_file_t file;
 } routed_response_t;
 
-/* Head of the live-connection list, used only by the idle-timeout sweep
- * to enumerate connections epoll itself won't list for us (epoll_wait
- * only reports ready fds, not the full registered set). A plain
- * file-scope static is fine here: this module only ever runs one event
- * loop per process, there is no concurrent instance to conflict with. */
-static connection_t *g_connections = NULL;
-
-/* Distinguishes the idle-timeout timer from a connection in
- * epoll_event.data.ptr. The listen socket uses NULL for the same
- * purpose; any other pointer value is a connection_t. The tag's address
- * is what matters, its (unused) value is irrelevant. */
+/* Distinguish the idle-timeout timer and the shutdown eventfd from a
+ * connection in epoll_event.data.ptr. The listen socket uses NULL for the
+ * same purpose; any other pointer value is a connection_t. Each tag's
+ * address is what matters, its (unused) value is irrelevant. Being
+ * read-only, they stay file-scope statics even with several loops
+ * running: sharing an immutable object across threads is not shared
+ * mutable state. */
 static const int g_timer_tag;
+static const int g_shutdown_tag;
 
 static int set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
@@ -116,20 +137,20 @@ static int set_nonblocking(int fd) {
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static void list_insert(connection_t *conn) {
+static void list_insert(event_loop_t *loop, connection_t *conn) {
     conn->prev = NULL;
-    conn->next = g_connections;
-    if (g_connections != NULL) {
-        g_connections->prev = conn;
+    conn->next = loop->connections;
+    if (loop->connections != NULL) {
+        loop->connections->prev = conn;
     }
-    g_connections = conn;
+    loop->connections = conn;
 }
 
-static void list_remove(connection_t *conn) {
+static void list_remove(event_loop_t *loop, connection_t *conn) {
     if (conn->prev != NULL) {
         conn->prev->next = conn->next;
     } else {
-        g_connections = conn->next;
+        loop->connections = conn->next;
     }
     if (conn->next != NULL) {
         conn->next->prev = conn->prev;
@@ -149,12 +170,12 @@ static void release_file_body(connection_t *conn) {
     conn->file_size = 0;
 }
 
-static void close_connection(connection_t *conn) {
+static void close_connection(event_loop_t *loop, connection_t *conn) {
     /* close() alone drops fd from the epoll set automatically, see
      * epoll(7). That only holds because we never dup() this fd
      * elsewhere, if we did, the epoll registration would outlive this
      * close and epoll_wait would hand back a dangling conn pointer. */
-    list_remove(conn);
+    list_remove(loop, conn);
     release_file_body(conn);
     close(conn->fd);
     free(conn);
@@ -238,31 +259,45 @@ static routed_response_t route_request(const http_request_parser_t *parser) {
 
 /* Both builders return what snprintf() returns: the length the response
  * *would* have had, which is how truncation is detected, see
- * set_write_buffer(). */
-static int build_response(char *out, size_t out_size, const routed_response_t *r, const char *connection_value) {
+ * set_write_buffer().
+ *
+ * X-Worker names the thread that produced the response. Which worker
+ * answers is decided by the kernel when it picks one of the SO_REUSEPORT
+ * listen sockets for an incoming connection, so without something like
+ * this the distribution is invisible from the outside and layer 6 would
+ * be untestable end to end (tests/test_thread_pool.py reads exactly this
+ * header). It is a deliberate, and deliberately small, piece of
+ * observability: a server exposing this in production would be telling
+ * clients how many workers it runs, which is why nothing else about the
+ * internals goes on the wire. */
+static int build_response(char *out, size_t out_size, const routed_response_t *r, const char *connection_value,
+                          int worker_id) {
     return snprintf(out, out_size,
                      "HTTP/1.1 %d %s\r\n"
                      "Content-Type: %s\r\n"
                      "Content-Length: %zu\r\n"
+                     "X-Worker: %d\r\n"
                      "%s"
                      "Connection: %s\r\n"
                      "\r\n"
                      "%s",
-                     r->status, r->reason, r->content_type, strlen(r->body),
+                     r->status, r->reason, r->content_type, strlen(r->body), worker_id,
                      r->extra_header != NULL ? r->extra_header : "", connection_value, r->body);
 }
 
 /* Head of a file response: same shape, but Content-Length comes from
  * fstat() and no body is appended, the body is what sendfile() streams
  * straight out of the page cache afterwards. */
-static int build_file_response_head(char *out, size_t out_size, const routed_response_t *r, const char *connection_value) {
+static int build_file_response_head(char *out, size_t out_size, const routed_response_t *r,
+                                    const char *connection_value, int worker_id) {
     return snprintf(out, out_size,
                      "HTTP/1.1 %d %s\r\n"
                      "Content-Type: %s\r\n"
                      "Content-Length: %jd\r\n"
+                     "X-Worker: %d\r\n"
                      "Connection: %s\r\n"
                      "\r\n",
-                     r->status, r->reason, r->content_type, (intmax_t)r->file.size, connection_value);
+                     r->status, r->reason, r->content_type, (intmax_t)r->file.size, worker_id, connection_value);
 }
 
 /* Drains conn->write_buf[write_sent..write_len) as far as the socket
@@ -361,11 +396,11 @@ static bool try_flush_response(connection_t *conn, bool *closed) {
     return try_sendfile_body(conn, closed);
 }
 
-static bool finish_after_response_sent(int epoll_fd, connection_t *conn) {
+static bool finish_after_response_sent(event_loop_t *loop, connection_t *conn) {
     release_file_body(conn);
 
     if (!conn->keep_alive_after_write) {
-        close_connection(conn);
+        close_connection(loop, conn);
         return false;
     }
 
@@ -376,9 +411,9 @@ static bool finish_after_response_sent(int epoll_fd, connection_t *conn) {
 
     if (conn->awaiting_writable) {
         struct epoll_event ev = {.events = EPOLLIN | EPOLLET, .data.ptr = conn};
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev) < 0) {
+        if (epoll_ctl(loop->epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev) < 0) {
             perror("epoll_ctl(MOD EPOLLIN)");
-            close_connection(conn);
+            close_connection(loop, conn);
             return false;
         }
         conn->awaiting_writable = false;
@@ -407,24 +442,24 @@ static bool finish_after_response_sent(int epoll_fd, connection_t *conn) {
  * fully flushed response whose Connection: close means we're done with
  * it), true if it's still alive (either fully flushed and reset for
  * another request, or now waiting on EPOLLOUT). */
-static bool send_response(int epoll_fd, connection_t *conn) {
+static bool send_response(event_loop_t *loop, connection_t *conn) {
     bool closed = false;
     bool done = try_flush_response(conn, &closed);
     if (closed) {
-        close_connection(conn);
+        close_connection(loop, conn);
         return false;
     }
     if (!done) {
         struct epoll_event ev = {.events = EPOLLOUT | EPOLLET, .data.ptr = conn};
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev) < 0) {
+        if (epoll_ctl(loop->epoll_fd, EPOLL_CTL_MOD, conn->fd, &ev) < 0) {
             perror("epoll_ctl(MOD EPOLLOUT)");
-            close_connection(conn);
+            close_connection(loop, conn);
             return false;
         }
         conn->awaiting_writable = true;
         return true;
     }
-    return finish_after_response_sent(epoll_fd, conn);
+    return finish_after_response_sent(loop, conn);
 }
 
 /* data may itself be conn->pending_input (see flush_pending_write's
@@ -453,7 +488,7 @@ static bool set_write_buffer(connection_t *conn, int written) {
 
 /* Fills conn->write_buf with the response for r and takes ownership of
  * r->file if it has one. */
-static void prepare_response(connection_t *conn, const routed_response_t *r, bool keep_alive) {
+static void prepare_response(connection_t *conn, const routed_response_t *r, bool keep_alive, int worker_id) {
     static const char internal_error[] = "HTTP/1.1 500 Internal Server Error\r\n"
                                          "Content-Type: text/plain\r\n"
                                          "Content-Length: 21\r\n"
@@ -464,8 +499,9 @@ static void prepare_response(connection_t *conn, const routed_response_t *r, boo
     conn->keep_alive_after_write = keep_alive;
 
     const char *connection_value = keep_alive ? "keep-alive" : "close";
-    int written = (r->file.fd >= 0) ? build_file_response_head(conn->write_buf, sizeof(conn->write_buf), r, connection_value)
-                                    : build_response(conn->write_buf, sizeof(conn->write_buf), r, connection_value);
+    int written = (r->file.fd >= 0)
+                      ? build_file_response_head(conn->write_buf, sizeof(conn->write_buf), r, connection_value, worker_id)
+                      : build_response(conn->write_buf, sizeof(conn->write_buf), r, connection_value, worker_id);
 
     if (!set_write_buffer(conn, written)) {
         fprintf(stderr, "response did not fit in %zu bytes, answering 500\n", sizeof(conn->write_buf));
@@ -491,7 +527,7 @@ static void prepare_response(connection_t *conn, const routed_response_t *r, boo
  * stashed whatever of this range is still unparsed). Returns false if
  * the connection was closed along the way: a parse error, a fatal write
  * error, or a fully flushed response whose Connection header was close. */
-static bool process_input(int epoll_fd, connection_t *conn, const char *data, size_t len) {
+static bool process_input(event_loop_t *loop, connection_t *conn, const char *data, size_t len) {
     size_t offset = 0;
 
     while (offset < len) {
@@ -513,9 +549,9 @@ static bool process_input(int epoll_fd, connection_t *conn, const char *data, si
          * that made it through before things went wrong. */
         bool keep_alive = malformed ? false : http_parser_should_keep_alive(&conn->parser);
 
-        prepare_response(conn, &r, keep_alive);
+        prepare_response(conn, &r, keep_alive, loop->worker_id);
 
-        if (!send_response(epoll_fd, conn)) {
+        if (!send_response(loop, conn)) {
             return false;
         }
         if (conn->awaiting_writable) {
@@ -536,14 +572,14 @@ static bool process_input(int epoll_fd, connection_t *conn, const char *data, si
  * until more bytes arrive (or forever, if the client is done sending).
  * We keep reading until the kernel tells us the socket is dry, handing
  * every chunk to process_input() as it arrives. */
-static void handle_client_readable(int epoll_fd, connection_t *conn) {
+static void handle_client_readable(event_loop_t *loop, connection_t *conn) {
     char buf[READ_CHUNK_SIZE];
 
     for (;;) {
         ssize_t n = read(conn->fd, buf, sizeof(buf));
         if (n > 0) {
             conn->last_activity = time(NULL);
-            if (!process_input(epoll_fd, conn, buf, (size_t)n)) {
+            if (!process_input(loop, conn, buf, (size_t)n)) {
                 return; /* closed */
             }
             if (conn->awaiting_writable) {
@@ -559,7 +595,7 @@ static void handle_client_readable(int epoll_fd, connection_t *conn) {
              * to answer; if we were just idling between keep-alive
              * requests this is simply the connection ending normally.
              * Either way there's no response owed. */
-            close_connection(conn);
+            close_connection(loop, conn);
             return;
         }
         if (errno == EINTR) {
@@ -569,7 +605,7 @@ static void handle_client_readable(int epoll_fd, connection_t *conn) {
             return; /* drained, this is the only correct exit from an ET read loop */
         }
         perror("read");
-        close_connection(conn);
+        close_connection(loop, conn);
         return;
     }
 }
@@ -577,24 +613,24 @@ static void handle_client_readable(int epoll_fd, connection_t *conn) {
 /* EPOLLOUT handler: resumes a response write that previously blocked,
  * whether it stalled in the buffered head or partway through the file
  * body. */
-static void flush_pending_write(int epoll_fd, connection_t *conn) {
+static void flush_pending_write(event_loop_t *loop, connection_t *conn) {
     bool closed = false;
     bool done = try_flush_response(conn, &closed);
     if (closed) {
-        close_connection(conn);
+        close_connection(loop, conn);
         return;
     }
     if (!done) {
         return; /* still can't write everything, stay armed for EPOLLOUT */
     }
-    if (!finish_after_response_sent(epoll_fd, conn)) {
+    if (!finish_after_response_sent(loop, conn)) {
         return; /* closed: the response we just finished had Connection: close */
     }
 
     if (conn->pending_input_len > 0) {
         size_t len = conn->pending_input_len;
         conn->pending_input_len = 0; /* clear first, process_input may need to stash into it again */
-        process_input(epoll_fd, conn, conn->pending_input, len);
+        process_input(loop, conn, conn->pending_input, len);
         /* Don't touch conn again here regardless of the outcome: by now
          * it may be closed (freed), fully caught up and back to plain
          * EPOLLIN waiting, or paused again on a second blocked write
@@ -607,10 +643,15 @@ static void flush_pending_write(int epoll_fd, connection_t *conn) {
  * would leave connections stranded in the backlog whenever two or more
  * complete their handshake between two epoll_wait() calls, and we'd
  * never get a second edge to remind us they're there. Draining to EAGAIN
- * is mandatory, not an optimization. */
-static void accept_new_connections(int epoll_fd, int listen_fd) {
+ * is mandatory, not an optimization.
+ *
+ * With SO_REUSEPORT there is no thundering herd to worry about here:
+ * this thread's listen socket has its own backlog, filled by the kernel
+ * alone, so a connection queued on it will not also be visible to any
+ * other worker. */
+static void accept_new_connections(event_loop_t *loop) {
     for (;;) {
-        int conn_fd = accept4(listen_fd, NULL, NULL, SOCK_NONBLOCK);
+        int conn_fd = accept4(loop->listen_fd, NULL, NULL, SOCK_NONBLOCK);
         if (conn_fd < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return; /* backlog fully drained for this edge */
@@ -647,15 +688,15 @@ static void accept_new_connections(int epoll_fd, int listen_fd) {
         /* Inserted before the epoll_ctl attempt below so that
          * close_connection() works uniformly whether registration
          * succeeds or fails. */
-        list_insert(conn);
+        list_insert(loop, conn);
 
         struct epoll_event ev = {
             .events = EPOLLIN | EPOLLET,
             .data.ptr = conn,
         };
-        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn_fd, &ev) < 0) {
+        if (epoll_ctl(loop->epoll_fd, EPOLL_CTL_ADD, conn_fd, &ev) < 0) {
             perror("epoll_ctl(ADD conn_fd)");
-            close_connection(conn);
+            close_connection(loop, conn);
         }
     }
 }
@@ -666,37 +707,80 @@ static void accept_new_connections(int epoll_fd, int listen_fd) {
  * between keep-alive requests. epoll has no built-in notion of a
  * per-fd idle timeout, so this periodic linear sweep of every open
  * connection is what actually enforces one. */
-static void sweep_idle_connections(int idle_timeout_seconds) {
+static void sweep_idle_connections(event_loop_t *loop) {
     time_t now = time(NULL);
-    connection_t *conn = g_connections;
+    connection_t *conn = loop->connections;
     while (conn != NULL) {
         connection_t *next = conn->next; /* close_connection frees conn, grab next first */
-        if (now - conn->last_activity >= idle_timeout_seconds) {
-            close_connection(conn);
+        if (now - conn->last_activity >= loop->idle_timeout_seconds) {
+            close_connection(loop, conn);
         }
         conn = next;
     }
 }
 
-int event_loop_run(int listen_fd, int idle_timeout_seconds) {
-    if (set_nonblocking(listen_fd) < 0) {
+/* Shutdown, and the only reason this loop has a teardown path at all.
+ * Left to process exit these would be reclaimed by the kernel anyway,
+ * but freeing them explicitly is what lets the integration tests treat
+ * any AddressSanitizer leak report at exit as a real bug rather than
+ * expected noise.
+ *
+ * In-flight responses are dropped rather than drained: a client mid
+ * download sees its connection close. Finishing them first would mean
+ * refusing new connections while looping until every write completes,
+ * with a deadline for peers that never read again, which is more
+ * shutdown machinery than this layer needs. */
+static void close_all_connections(event_loop_t *loop) {
+    while (loop->connections != NULL) {
+        close_connection(loop, loop->connections);
+    }
+}
+
+/* Only for the diagnostic below: the three non-connection fds in the
+ * epoll set, identified by their data.ptr tag. */
+static const char *infrastructure_fd_name(const void *tag) {
+    if (tag == NULL) {
+        return "listen socket";
+    }
+    if (tag == &g_timer_tag) {
+        return "idle-timeout timer";
+    }
+    return "shutdown eventfd";
+}
+
+static bool is_infrastructure_fd(const void *tag) {
+    return tag == NULL || tag == &g_timer_tag || tag == &g_shutdown_tag;
+}
+
+int event_loop_run(const event_loop_config_t *config) {
+    event_loop_t loop = {
+        .epoll_fd = -1,
+        .listen_fd = config->listen_fd,
+        .timer_fd = -1,
+        .idle_timeout_seconds = config->idle_timeout_seconds,
+        .worker_id = config->worker_id,
+        .connections = NULL,
+    };
+
+    if (set_nonblocking(loop.listen_fd) < 0) {
         perror("fcntl(listen_fd, O_NONBLOCK)");
         return -1;
     }
 
-    int epoll_fd = epoll_create1(0);
-    if (epoll_fd < 0) {
+    loop.epoll_fd = epoll_create1(0);
+    if (loop.epoll_fd < 0) {
         perror("epoll_create1");
         return -1;
     }
 
-    /* data.ptr == NULL marks the listen socket, &g_timer_tag marks the
-     * idle-timeout timer, anything else is a connection_t. events[]
-     * tells us which case we're in without a separate fd lookup. */
+    /* data.ptr == NULL marks the listen socket, &g_timer_tag the
+     * idle-timeout timer, &g_shutdown_tag the shutdown eventfd, anything
+     * else is a connection_t. events[] tells us which case we're in
+     * without a separate fd lookup. */
     struct epoll_event listen_ev = {.events = EPOLLIN | EPOLLET, .data.ptr = NULL};
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &listen_ev) < 0) {
+    if (epoll_ctl(loop.epoll_fd, EPOLL_CTL_ADD, loop.listen_fd, &listen_ev) < 0) {
         perror("epoll_ctl(ADD listen_fd)");
-        close(epoll_fd);
+        close(loop.epoll_fd);
         return -1;
     }
 
@@ -705,34 +789,56 @@ int event_loop_run(int listen_fd, int idle_timeout_seconds) {
      * loop happens to wake up for I/O, and it's just another fd in the
      * same epoll set rather than a special case in the wait call, see
      * timerfd_create(2). */
-    int timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
-    if (timer_fd < 0) {
+    loop.timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    if (loop.timer_fd < 0) {
         perror("timerfd_create");
-        close(epoll_fd);
+        close(loop.epoll_fd);
         return -1;
     }
     struct itimerspec sweep_interval = {
         .it_interval = {.tv_sec = IDLE_SWEEP_INTERVAL_SECONDS, .tv_nsec = 0},
         .it_value = {.tv_sec = IDLE_SWEEP_INTERVAL_SECONDS, .tv_nsec = 0},
     };
-    if (timerfd_settime(timer_fd, 0, &sweep_interval, NULL) < 0) {
+    if (timerfd_settime(loop.timer_fd, 0, &sweep_interval, NULL) < 0) {
         perror("timerfd_settime");
-        close(timer_fd);
-        close(epoll_fd);
+        close(loop.timer_fd);
+        close(loop.epoll_fd);
         return -1;
     }
     struct epoll_event timer_ev = {.events = EPOLLIN | EPOLLET, .data.ptr = (void *)&g_timer_tag};
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer_fd, &timer_ev) < 0) {
+    if (epoll_ctl(loop.epoll_fd, EPOLL_CTL_ADD, loop.timer_fd, &timer_ev) < 0) {
         perror("epoll_ctl(ADD timer_fd)");
-        close(timer_fd);
-        close(epoll_fd);
+        close(loop.timer_fd);
+        close(loop.epoll_fd);
         return -1;
     }
 
-    struct epoll_event events[MAX_EVENTS];
+    /* Deliberately level-triggered, the one fd in this set that is: the
+     * same eventfd is registered in every worker's epoll instance and
+     * nobody ever read()s it, so once the signal handler writes to it,
+     * it stays readable and every worker sees it, whether it was already
+     * parked in epoll_wait or only gets there later. Edge-triggered
+     * would deliver that single write to whichever epoll instances
+     * happened to be watching at that instant and lose it for the rest.
+     * Level-triggered also means this fd wakes us on every iteration
+     * from then on, which is harmless because the first wakeup leaves
+     * the loop. */
+    if (config->shutdown_fd >= 0) {
+        struct epoll_event shutdown_ev = {.events = EPOLLIN, .data.ptr = (void *)&g_shutdown_tag};
+        if (epoll_ctl(loop.epoll_fd, EPOLL_CTL_ADD, config->shutdown_fd, &shutdown_ev) < 0) {
+            perror("epoll_ctl(ADD shutdown_fd)");
+            close(loop.timer_fd);
+            close(loop.epoll_fd);
+            return -1;
+        }
+    }
 
-    for (;;) {
-        int ready = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+    struct epoll_event events[MAX_EVENTS];
+    int status = 0;
+    bool running = true;
+
+    while (running) {
+        int ready = epoll_wait(loop.epoll_fd, events, MAX_EVENTS, -1);
         if (ready < 0) {
             if (errno == EINTR) {
                 continue; /* epoll_wait(2): a caught signal restarts the wait */
@@ -745,26 +851,33 @@ int event_loop_run(int listen_fd, int idle_timeout_seconds) {
             void *ud = events[i].data.ptr;
 
             if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-                if (ud == NULL || ud == (void *)&g_timer_tag) {
-                    /* The listen socket or the idle-timeout timer itself
-                     * is broken, neither has a sane degraded mode (no
-                     * more accepts, or silently losing Slowloris
-                     * protection), so there is no point continuing. */
-                    fprintf(stderr, "%s reported EPOLLERR/EPOLLHUP, giving up\n",
-                            ud == NULL ? "listen socket" : "idle-timeout timer");
-                    close(timer_fd);
-                    close(epoll_fd);
-                    return -1;
+                if (is_infrastructure_fd(ud)) {
+                    /* The listen socket, the idle-timeout timer or the
+                     * shutdown eventfd is broken. None has a sane
+                     * degraded mode (no more accepts, silently losing
+                     * Slowloris protection, or never noticing SIGTERM),
+                     * so there is no point continuing. */
+                    fprintf(stderr, "worker %d: %s reported EPOLLERR/EPOLLHUP, giving up\n", loop.worker_id,
+                            infrastructure_fd_name(ud));
+                    status = -1;
+                    running = false;
+                    break;
                 }
-                close_connection((connection_t *)ud);
+                close_connection(&loop, (connection_t *)ud);
                 continue;
             }
 
             if (ud == NULL) {
-                accept_new_connections(epoll_fd, listen_fd);
+                accept_new_connections(&loop);
+            } else if (ud == (void *)&g_shutdown_tag) {
+                /* Nothing to read: the fd's readability *is* the whole
+                 * message, and leaving the counter alone is what keeps
+                 * the other workers' epoll instances firing too. */
+                running = false;
+                break;
             } else if (ud == (void *)&g_timer_tag) {
                 uint64_t expirations;
-                ssize_t n = read(timer_fd, &expirations, sizeof(expirations));
+                ssize_t n = read(loop.timer_fd, &expirations, sizeof(expirations));
                 /* timerfd_read(2, "Reading from a timerfd"): a read
                  * always returns exactly sizeof(uint64_t) or fails with
                  * EAGAIN, never a short read. A different failure here
@@ -775,19 +888,20 @@ int event_loop_run(int listen_fd, int idle_timeout_seconds) {
                 if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                     perror("read(timer_fd)");
                 }
-                sweep_idle_connections(idle_timeout_seconds);
+                sweep_idle_connections(&loop);
             } else {
                 connection_t *conn = (connection_t *)ud;
                 if (conn->awaiting_writable) {
-                    flush_pending_write(epoll_fd, conn);
+                    flush_pending_write(&loop, conn);
                 } else {
-                    handle_client_readable(epoll_fd, conn);
+                    handle_client_readable(&loop, conn);
                 }
             }
         }
     }
 
-    close(timer_fd);
-    close(epoll_fd);
-    return 0;
+    close_all_connections(&loop);
+    close(loop.timer_fd);
+    close(loop.epoll_fd);
+    return status;
 }

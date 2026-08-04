@@ -1,12 +1,14 @@
-#include <arpa/inet.h>
+#include <errno.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/socket.h>
+#include <string.h>
+#include <sys/eventfd.h>
 #include <unistd.h>
 
-#include "event_loop.h"
 #include "static_files.h"
+#include "worker_pool.h"
 
 #define PORT 8080
 #define BACKLOG 128 /* completed connections queued for accept(); does not bound in-flight SYNs */
@@ -20,10 +22,12 @@
 /* Slowloris opens many connections and either sends nothing at all or
  * trickles a request a few bytes at a time, never completing it, tying
  * up a connection slot indefinitely without ever giving the server a
- * request it can answer and close normally. A single-threaded,
- * one-fd-per-connection server like this one has a hard ceiling on
- * concurrent connections (see ulimit -n), so a handful of such clients
- * can starve every legitimate one.
+ * request it can answer and close normally. A one-fd-per-connection
+ * server like this one has a hard ceiling on concurrent connections (see
+ * ulimit -n), so a handful of such clients can starve every legitimate
+ * one. Layer 6 raises the ceiling by spreading connections over several
+ * threads, it does not remove it: the fd limit is per process, not per
+ * thread, so the timeout is what actually reclaims those slots.
  *
  * 30s is a compromise: generous enough that a real client on a slow
  * mobile link, or one just pausing briefly between keep-alive requests,
@@ -38,6 +42,54 @@
  * driven down for fast integration tests, see tests/test_keepalive.py. */
 #define DEFAULT_IDLE_TIMEOUT_SECONDS 30
 
+/* Written to by the SIGINT/SIGTERM handler, and read by every worker's
+ * epoll instance. It is the only piece of state the signal handler can
+ * touch, and eventfd is what makes that safe: write(2) is
+ * async-signal-safe, so the handler does nothing but post 1 to a counter
+ * and the actual shutdown work happens back in the event loops, on their
+ * own threads, with the full C library available.
+ *
+ * The alternative, a `volatile sig_atomic_t stop` flag polled by the
+ * loops, would need every worker to be woken up to notice it: they sit
+ * in epoll_wait() with an infinite timeout, and a signal only interrupts
+ * whichever single thread happens to run the handler. Making the flag an
+ * fd puts it in the same epoll set as everything else, so one write wakes
+ * all N workers at once. */
+static int g_shutdown_fd = -1;
+
+static void handle_shutdown_signal(int signum) {
+    (void)signum;
+
+    /* errno is per thread but the handler runs on some thread's stack
+     * mid-syscall, so clobbering it here would corrupt whatever that
+     * thread was about to inspect. */
+    int saved_errno = errno;
+    uint64_t one = 1;
+    ssize_t written = write(g_shutdown_fd, &one, sizeof(one));
+    /* Nothing to do if it fails, and nothing safe to say either
+     * (fprintf is not async-signal-safe). The result is only consumed to
+     * keep -Wunused-result quiet: the one plausible failure is EAGAIN
+     * from the counter saturating, which would take 2^64-1 signals. */
+    (void)written;
+    errno = saved_errno;
+}
+
+static int install_shutdown_handler(int signum) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_shutdown_signal;
+    sigemptyset(&sa.sa_mask);
+    /* No SA_RESTART: the loops already treat EINTR from epoll_wait as
+     * "go round again", and an interrupted syscall here is harmless
+     * because the eventfd write has already happened by then. */
+    sa.sa_flags = 0;
+    if (sigaction(signum, &sa, NULL) < 0) {
+        perror("sigaction");
+        return -1;
+    }
+    return 0;
+}
+
 static int idle_timeout_from_env(void) {
     const char *raw = getenv("HTTP_SERVER_IDLE_TIMEOUT_SECONDS");
     if (raw == NULL || raw[0] == '\0') {
@@ -51,43 +103,6 @@ static int idle_timeout_from_env(void) {
         return DEFAULT_IDLE_TIMEOUT_SECONDS;
     }
     return (int)value;
-}
-
-static int create_listen_socket(void) {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
-        perror("socket");
-        exit(EXIT_FAILURE);
-    }
-
-    /* Without this, restarting the server right after it exits fails with
-     * EADDRINUSE while the previous socket sits in TIME_WAIT. */
-    int opt = 1;
-    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt");
-        close(fd);
-        exit(EXIT_FAILURE);
-    }
-
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_addr.s_addr = htonl(INADDR_ANY),
-        .sin_port = htons(PORT),
-    };
-
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        close(fd);
-        exit(EXIT_FAILURE);
-    }
-
-    if (listen(fd, BACKLOG) < 0) {
-        perror("listen");
-        close(fd);
-        exit(EXIT_FAILURE);
-    }
-
-    return fd;
 }
 
 int main(void) {
@@ -105,7 +120,9 @@ int main(void) {
 
     /* Resolved once, up front: a document root that doesn't exist is a
      * misconfiguration worth failing on immediately, not something to
-     * discover as a puzzling 404 on every request later. */
+     * discover as a puzzling 404 on every request later. Doing it before
+     * any thread exists also means the resolved root is only ever
+     * written once, and read-only for every worker afterwards. */
     const char *public_root = getenv("HTTP_SERVER_PUBLIC_ROOT");
     if (public_root == NULL || public_root[0] == '\0') {
         public_root = DEFAULT_PUBLIC_ROOT;
@@ -114,13 +131,44 @@ int main(void) {
         return EXIT_FAILURE;
     }
 
-    int listen_fd = create_listen_socket();
+    /* EFD_NONBLOCK because a signal handler must never block, EFD_CLOEXEC
+     * out of habit: nothing here execs, but an fd that would silently
+     * leak into a child if that ever changed is not worth leaving open. */
+    g_shutdown_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (g_shutdown_fd < 0) {
+        perror("eventfd");
+        return EXIT_FAILURE;
+    }
+
+    /* Installed before any thread exists, so every worker is created
+     * with the handler already in place. Signals are delivered to an
+     * arbitrary thread that hasn't blocked them, which doesn't matter
+     * here: whichever one runs the handler, the eventfd it writes is
+     * seen by all of them. */
+    if (install_shutdown_handler(SIGINT) < 0 || install_shutdown_handler(SIGTERM) < 0) {
+        close(g_shutdown_fd);
+        return EXIT_FAILURE;
+    }
+
     int idle_timeout_seconds = idle_timeout_from_env();
-    printf("Servidor escutando na porta %d (epoll, edge-triggered, keep-alive, idle timeout %ds, estáticos de '%s')...\n",
-           PORT, idle_timeout_seconds, public_root);
+    worker_pool_config_t pool = {
+        .port = PORT,
+        .backlog = BACKLOG,
+        .worker_count = worker_pool_worker_count(),
+        .idle_timeout_seconds = idle_timeout_seconds,
+        .shutdown_fd = g_shutdown_fd,
+    };
 
-    int status = event_loop_run(listen_fd, idle_timeout_seconds);
+    printf("Servidor escutando na porta %d (%d thread(s) via SO_REUSEPORT, epoll edge-triggered, keep-alive, "
+           "idle timeout %ds, estáticos de '%s')...\n",
+           PORT, pool.worker_count, idle_timeout_seconds, public_root);
+    /* stdout is a pipe under the integration tests, so it is fully
+     * buffered rather than line buffered: without this the banner would
+     * only appear when the buffer fills or the process exits. */
+    fflush(stdout);
 
-    close(listen_fd);
+    int status = worker_pool_run(&pool);
+
+    close(g_shutdown_fd);
     return status == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

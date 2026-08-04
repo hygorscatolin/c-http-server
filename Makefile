@@ -6,11 +6,20 @@ CC = gcc
 # AddressSanitizer is normally built at, being enough to keep the
 # instrumented binary usable without folding away the frames a report
 # needs.
-CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -O1 -g -fsanitize=address,undefined -Isrc
-LDFLAGS = -fsanitize=address,undefined
+#
+# -pthread is a compile flag as much as a link flag: it defines
+# _REENTRANT and turns on the thread-safe paths in libc's headers, so
+# passing it only to the linker is a subtly broken build rather than a
+# style choice. AddressSanitizer's data-race blindness is worth knowing
+# about here: it does not detect them at all, that is ThreadSanitizer's
+# job, and the two cannot be enabled at once. Layer 6 answers this by
+# construction rather than by tooling, see worker_pool.c: workers share
+# no mutable state, so there is nothing for a race detector to find.
+CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -O1 -g -fsanitize=address,undefined -pthread -Isrc
+LDFLAGS = -fsanitize=address,undefined -pthread
 
-SRC = src/main.c src/event_loop.c src/http_parser.c src/static_files.c
-HDR = src/event_loop.h src/http_parser.h src/static_files.h
+SRC = src/main.c src/event_loop.c src/http_parser.c src/static_files.c src/worker_pool.c
+HDR = src/event_loop.h src/http_parser.h src/static_files.h src/worker_pool.h
 BIN = http-server
 
 PARSER_TEST_SRC = tests/test_http_parser.c src/http_parser.c
@@ -19,7 +28,7 @@ PARSER_TEST_BIN = test_http_parser
 STATIC_TEST_SRC = tests/test_static_files.c src/static_files.c
 STATIC_TEST_BIN = test_static_files
 
-.PHONY: all run test test-keepalive test-static test-all clean
+.PHONY: all run test test-keepalive test-static test-threads test-all clean
 
 all: $(BIN)
 
@@ -52,7 +61,12 @@ test-keepalive: all
 test-static: all
 	python3 tests/test_static_files.py
 
-test-all: test test-keepalive test-static
+# And layer 6: which worker answered is only observable from outside the
+# process, so this one is necessarily an integration test too.
+test-threads: all
+	python3 tests/test_thread_pool.py
+
+test-all: test test-keepalive test-static test-threads
 
 clean:
 	rm -f $(BIN) $(PARSER_TEST_BIN) $(STATIC_TEST_BIN)
