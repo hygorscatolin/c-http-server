@@ -7,16 +7,11 @@ so unlike tests/test_http_parser.c this drives the actual compiled
 binary instead of linking against the source directly.
 """
 
-import os
-import signal
 import socket
-import subprocess
-import sys
 import time
 
-SERVER_BIN = os.path.join(os.path.dirname(__file__), "..", "http-server")
-HOST = "127.0.0.1"
-PORT = 8080
+from http_test_utils import HOST, PORT, ResponseReader, check, header_value, parse_status, report, running_server
+
 # Kept short so the idle-timeout tests don't make the suite slow. The
 # server reads this from the environment, see main.c.
 IDLE_TIMEOUT_SECONDS = 2
@@ -26,80 +21,6 @@ IDLE_TIMEOUT_SECONDS = 2
 # before anyone notices it. Not configurable via environment, hence the
 # duplicated literal here rather than reading it back from the server.
 SWEEP_INTERVAL_SECONDS = 5
-
-failures = []
-
-
-def check(condition, description):
-    status = "ok" if condition else "FAIL"
-    print(f"  [{status}] {description}")
-    if not condition:
-        failures.append(description)
-
-
-class ResponseReader:
-    """Reads exactly one HTTP response at a time off a socket, using
-    Content-Length to find the boundary. Needed because recv() has no
-    notion of "one response": on a pipelined or keep-alive connection a
-    single recv() can return two responses concatenated, or half of one,
-    depending entirely on TCP segmentation and timing, not on anything
-    the server does. A naive one-recv-per-response test would be racy.
-    """
-
-    def __init__(self, sock):
-        self.sock = sock
-        self.buf = b""
-
-    def _fill(self, timeout):
-        self.sock.settimeout(timeout)
-        chunk = self.sock.recv(65536)
-        if chunk == b"":
-            return False
-        self.buf += chunk
-        return True
-
-    def read_one(self, timeout=2.0):
-        while b"\r\n\r\n" not in self.buf:
-            if not self._fill(timeout):
-                raise ConnectionError("peer closed before headers completed")
-        head_end = self.buf.index(b"\r\n\r\n") + 4
-        content_length = int(header_value(self.buf[:head_end], "Content-Length") or "0")
-        total_len = head_end + content_length
-        while len(self.buf) < total_len:
-            if not self._fill(timeout):
-                raise ConnectionError("peer closed before body completed")
-        response, self.buf = self.buf[:total_len], self.buf[total_len:]
-        return response
-
-    def expect_eof(self, timeout=2.0):
-        if self.buf:
-            return False
-        self.sock.settimeout(timeout)
-        try:
-            chunk = self.sock.recv(65536)
-        except (socket.timeout, TimeoutError):
-            # Didn't close within the window: still open, which for this
-            # check is exactly as much a failure as getting real data
-            # back would be. Report it that way instead of crashing the
-            # whole suite on an uncaught exception.
-            return False
-        return chunk == b""
-
-
-def parse_status(response: bytes) -> int:
-    first_line = response.split(b"\r\n", 1)[0]
-    return int(first_line.split(b" ")[1])
-
-
-def header_value(response: bytes, name: str):
-    head = response.split(b"\r\n\r\n", 1)[0]
-    for line in head.split(b"\r\n")[1:]:
-        if b":" not in line:
-            continue
-        k, v = line.split(b":", 1)
-        if k.strip().lower() == name.lower().encode():
-            return v.strip().decode()
-    return None
 
 
 def test_http11_keep_alive_serves_two_requests_on_one_socket():
@@ -237,16 +158,7 @@ def test_active_connection_survives_past_one_timeout_window():
 
 
 def main():
-    env = os.environ.copy()
-    env["HTTP_SERVER_IDLE_TIMEOUT_SECONDS"] = str(IDLE_TIMEOUT_SECONDS)
-
-    proc = subprocess.Popen([SERVER_BIN], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    try:
-        time.sleep(0.4)
-        if proc.poll() is not None:
-            print("server exited immediately, aborting", file=sys.stderr)
-            sys.exit(1)
-
+    with running_server({"HTTP_SERVER_IDLE_TIMEOUT_SECONDS": str(IDLE_TIMEOUT_SECONDS)}):
         test_http11_keep_alive_serves_two_requests_on_one_socket()
         test_connection_close_header_closes_after_one_response()
         test_http10_defaults_to_close()
@@ -256,21 +168,8 @@ def main():
         test_active_connection_survives_past_one_timeout_window()
         test_idle_connection_is_closed_after_timeout()
         test_idle_timeout_also_applies_between_keepalive_requests()
-    finally:
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
 
-    print()
-    if failures:
-        print(f"{len(failures)} check(s) FAILED:")
-        for f in failures:
-            print(f"  - {f}")
-        sys.exit(1)
-    print("all checks passed")
+    report()
 
 
 if __name__ == "__main__":

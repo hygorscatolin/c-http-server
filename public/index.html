@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="utf-8">
+    <title>http-server — camada 5</title>
+    <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+    <h1>Arquivos estáticos com sendfile()</h1>
+    <p>
+        Esta página saiu do disco direto para o socket: o corpo nunca passou
+        por um buffer em user space, o kernel copiou os bytes do page cache
+        para a rede em <code>sendfile(2)</code>.
+    </p>
+    <p>
+        Outros arquivos para testar:
+        <a href="/hello.txt">/hello.txt</a>,
+        <a href="/assets/style.css">/assets/style.css</a>.
+    </p>
+</body>
+</html>

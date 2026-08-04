@@ -15,3 +15,5 @@ server
 *.pem
 *.key
 test_http_parser
+test_static_files
+__pycache__/

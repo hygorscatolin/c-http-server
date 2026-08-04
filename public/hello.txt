@@ -1,0 +1,5 @@
+Servido de public/hello.txt por sendfile(2), sem copiar o conteudo para
+user space: o kernel move os bytes do page cache direto para o socket.
+
+Content-Type vem da extensao (.txt -> text/plain), Content-Length vem do
+fstat() feito no momento em que o arquivo foi aberto.

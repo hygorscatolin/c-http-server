@@ -12,16 +12,24 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/timerfd.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "http_parser.h"
+#include "static_files.h"
 
 #define MAX_EVENTS 64
 #define READ_CHUNK_SIZE 4096
 #define RESPONSE_BUF_SIZE 512
+
+/* sendfile(2) refuses counts above 0x7ffff000 on Linux ("if count is
+ * larger, it is capped" in some versions, EINVAL in others), so a file
+ * bigger than 2GB has to be handed over in several calls regardless of
+ * how much the socket would take. */
+#define SENDFILE_MAX_CHUNK 0x7ffff000
 
 /* How often the idle-timeout sweep runs, independent of how often the
  * loop happens to wake up for I/O. See main.c for the timeout value
@@ -42,10 +50,11 @@ typedef struct connection {
     struct connection *prev;
     struct connection *next;
 
-    /* Holds the response currently being sent. Always built fresh by
-     * process_input() before send_response() is called, then possibly
-     * re-sent across several EPOLLOUT wakeups if the client is a slow
-     * reader. Fixed size instead of malloc'd: every response this
+    /* Holds the response head currently being sent (status line plus
+     * headers, and for the built-in routes the body too). Always built
+     * fresh by process_input() before send_response() is called, then
+     * possibly re-sent across several EPOLLOUT wakeups if the client is
+     * a slow reader. Fixed size instead of malloc'd: every response this
      * server produces is a short, known-shape status line, so there's
      * nothing to gain from a heap buffer sized to fit exactly. */
     char write_buf[RESPONSE_BUF_SIZE];
@@ -53,6 +62,15 @@ typedef struct connection {
     size_t write_sent;
     bool keep_alive_after_write;
     bool awaiting_writable; /* true while registered for EPOLLOUT instead of EPOLLIN, see send_response() */
+
+    /* Static file body still to be streamed with sendfile(), or fd < 0
+     * when the response has no file body. -1 rather than 0 is load
+     * bearing: connections are memset to zero on accept, and fd 0 is a
+     * perfectly valid descriptor, so a zeroed field would read as "a
+     * file is open" and get stdin closed on the first response. */
+    int file_fd;
+    off_t file_offset; /* bytes of the file already handed to the kernel */
+    off_t file_size;   /* from fstat() at open time, and what Content-Length promised */
 
     /* Bytes already read() off the wire but not yet parsed, stashed here
      * only when process_input() has to pause mid-batch because a
@@ -67,8 +85,14 @@ typedef struct connection {
 typedef struct {
     int status;
     const char *reason;
-    const char *body;
+    const char *body;         /* in-memory body, NULL when the body is file.fd */
+    const char *content_type;
     const char *extra_header; /* raw header line incl. trailing CRLF, or NULL */
+
+    /* file.fd >= 0 means the body comes from the filesystem and body is
+     * NULL. Ownership of that fd transfers to whoever handles this
+     * response, see process_input(). */
+    static_file_t file;
 } routed_response_t;
 
 /* Head of the live-connection list, used only by the idle-timeout sweep
@@ -112,12 +136,26 @@ static void list_remove(connection_t *conn) {
     }
 }
 
+/* Releases the file backing the current response, if any. Every exit
+ * path out of a file response goes through here or close_connection(),
+ * otherwise a client hanging up mid-download would leak an fd per
+ * request until accept() starts failing with EMFILE. */
+static void release_file_body(connection_t *conn) {
+    if (conn->file_fd >= 0) {
+        close(conn->file_fd);
+        conn->file_fd = -1;
+    }
+    conn->file_offset = 0;
+    conn->file_size = 0;
+}
+
 static void close_connection(connection_t *conn) {
     /* close() alone drops fd from the epoll set automatically, see
      * epoll(7). That only holds because we never dup() this fd
      * elsewhere, if we did, the epoll registration would outlive this
      * close and epoll_wait would hand back a dangling conn pointer. */
     list_remove(conn);
+    release_file_body(conn);
     close(conn->fd);
     free(conn);
 }
@@ -134,33 +172,97 @@ static bool path_is(const http_request_parser_t *p, const char *target) {
     return path_len == target_len && memcmp(p->path, target, target_len) == 0;
 }
 
+/* Every response whose body is a short constant. Centralized mostly so
+ * the file field can't be left uninitialized (a zeroed one would mean
+ * "fd 0 holds the body"). */
+static routed_response_t simple_response(int status, const char *reason, const char *body, const char *extra_header) {
+    return (routed_response_t){
+        .status = status,
+        .reason = reason,
+        .body = body,
+        .content_type = "text/plain",
+        .extra_header = extra_header,
+        .file = {.fd = -1, .size = 0, .content_type = NULL},
+    };
+}
+
+/* RFC 7231 section 6.5.5 requires a 405 response to list the methods the
+ * target does support in an Allow header. */
+static routed_response_t method_not_allowed(void) {
+    return simple_response(405, "Method Not Allowed", "Method Not Allowed", "Allow: GET\r\n");
+}
+
+/* Anything the built-in routes didn't claim is looked up as a file under
+ * the document root. */
+static routed_response_t route_static_file(const http_request_parser_t *parser) {
+    static_file_t file;
+    switch (static_file_open(parser->path, parser->path_len, &file)) {
+    case STATIC_FILE_INVALID_PATH:
+        return simple_response(400, "Bad Request", "Bad Request", NULL);
+    case STATIC_FILE_NOT_FOUND:
+        return simple_response(404, "Not Found", "Not Found", NULL);
+    case STATIC_FILE_OK:
+        break;
+    }
+
+    /* Method check deliberately after the lookup: 405 asserts that the
+     * resource exists and merely doesn't accept this method, so a
+     * nonexistent path must answer 404 whatever the method was. */
+    if (parser->method_id != HTTP_METHOD_GET) {
+        static_file_close(&file);
+        return method_not_allowed();
+    }
+
+    return (routed_response_t){
+        .status = 200,
+        .reason = "OK",
+        .body = NULL,
+        .content_type = file.content_type,
+        .extra_header = NULL,
+        .file = file,
+    };
+}
+
 static routed_response_t route_request(const http_request_parser_t *parser) {
     if (path_is(parser, "/") || path_is(parser, "/hello")) {
         if (parser->method_id != HTTP_METHOD_GET) {
-            /* RFC 7231 section 6.5.5 requires a 405 response to list the
-             * methods the target does support in an Allow header. */
-            return (routed_response_t){
-                .status = 405, .reason = "Method Not Allowed", .body = "Method Not Allowed", .extra_header = "Allow: GET\r\n"};
+            return method_not_allowed();
         }
         if (path_is(parser, "/")) {
-            return (routed_response_t){.status = 200, .reason = "OK", .body = "Hello from my C server!", .extra_header = NULL};
+            return simple_response(200, "OK", "Hello from my C server!", NULL);
         }
-        return (routed_response_t){.status = 200, .reason = "OK", .body = "Hello, hello!", .extra_header = NULL};
+        return simple_response(200, "OK", "Hello, hello!", NULL);
     }
-    return (routed_response_t){.status = 404, .reason = "Not Found", .body = "Not Found", .extra_header = NULL};
+    return route_static_file(parser);
 }
 
-static int build_response(char *out, size_t out_size, int status, const char *reason, const char *body,
-                           const char *extra_header, const char *connection_value) {
+/* Both builders return what snprintf() returns: the length the response
+ * *would* have had, which is how truncation is detected, see
+ * set_write_buffer(). */
+static int build_response(char *out, size_t out_size, const routed_response_t *r, const char *connection_value) {
     return snprintf(out, out_size,
                      "HTTP/1.1 %d %s\r\n"
-                     "Content-Type: text/plain\r\n"
+                     "Content-Type: %s\r\n"
                      "Content-Length: %zu\r\n"
                      "%s"
                      "Connection: %s\r\n"
                      "\r\n"
                      "%s",
-                     status, reason, strlen(body), extra_header != NULL ? extra_header : "", connection_value, body);
+                     r->status, r->reason, r->content_type, strlen(r->body),
+                     r->extra_header != NULL ? r->extra_header : "", connection_value, r->body);
+}
+
+/* Head of a file response: same shape, but Content-Length comes from
+ * fstat() and no body is appended, the body is what sendfile() streams
+ * straight out of the page cache afterwards. */
+static int build_file_response_head(char *out, size_t out_size, const routed_response_t *r, const char *connection_value) {
+    return snprintf(out, out_size,
+                     "HTTP/1.1 %d %s\r\n"
+                     "Content-Type: %s\r\n"
+                     "Content-Length: %jd\r\n"
+                     "Connection: %s\r\n"
+                     "\r\n",
+                     r->status, r->reason, r->content_type, (intmax_t)r->file.size, connection_value);
 }
 
 /* Drains conn->write_buf[write_sent..write_len) as far as the socket
@@ -189,7 +291,79 @@ static bool try_flush_write_buffer(connection_t *conn, bool *closed) {
     return true;
 }
 
+/* Streams the file body straight from the page cache to the socket:
+ * sendfile(2) copies between two descriptors inside the kernel, so the
+ * bytes never make the round trip into a user-space buffer and back the
+ * way a read()/write() loop would.
+ *
+ * Passing &conn->file_offset (rather than NULL) means the kernel reads
+ * from that offset and updates it by however much it transferred, while
+ * leaving file_fd's own file position untouched. That is what makes
+ * resuming after EAGAIN trivial: the offset already says where to pick
+ * up, no lseek() and no separate bookkeeping.
+ *
+ * On a non-blocking socket a short transfer is entirely normal, not an
+ * error, so the loop keeps going until the kernel says EAGAIN or the
+ * whole file is out. Semantics match try_flush_write_buffer(): *closed
+ * flags a fatal error, the return value only tells "done" from "blocked,
+ * come back on EPOLLOUT". */
+static bool try_sendfile_body(connection_t *conn, bool *closed) {
+    *closed = false;
+
+    while (conn->file_offset < conn->file_size) {
+        off_t remaining = conn->file_size - conn->file_offset;
+        size_t count = (remaining > SENDFILE_MAX_CHUNK) ? SENDFILE_MAX_CHUNK : (size_t)remaining;
+
+        ssize_t n = sendfile(conn->fd, conn->file_fd, &conn->file_offset, count);
+        if (n > 0) {
+            continue; /* file_offset was advanced by the kernel */
+        }
+        if (n == 0) {
+            /* EOF before file_size bytes: the file was truncated after
+             * we fstat()ed it, so the Content-Length already on the wire
+             * is now a lie. There is no way to correct a header that has
+             * been sent, and a short body would desynchronize a
+             * keep-alive connection, so the only honest framing signal
+             * left is closing the connection. */
+            fprintf(stderr, "static file shrank while being sent, closing connection\n");
+            *closed = true;
+            return false;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return false; /* socket buffer full, resume on the next EPOLLOUT edge */
+        }
+        /* EPIPE lands here when the client hung up mid-download. It
+         * arrives as an errno rather than a fatal signal only because
+         * main() ignores SIGPIPE, sendfile() has no MSG_NOSIGNAL to opt
+         * out per call the way send() does. */
+        perror("sendfile");
+        *closed = true;
+        return false;
+    }
+
+    return true;
+}
+
+/* The whole response in order: buffered head first, then the file body.
+ * The head must be fully out before sendfile() runs, otherwise a partial
+ * header write would end up with body bytes spliced into the middle of
+ * the headers. */
+static bool try_flush_response(connection_t *conn, bool *closed) {
+    if (!try_flush_write_buffer(conn, closed)) {
+        return false;
+    }
+    if (conn->file_fd < 0) {
+        return true;
+    }
+    return try_sendfile_body(conn, closed);
+}
+
 static bool finish_after_response_sent(int epoll_fd, connection_t *conn) {
+    release_file_body(conn);
+
     if (!conn->keep_alive_after_write) {
         close_connection(conn);
         return false;
@@ -235,7 +409,7 @@ static bool finish_after_response_sent(int epoll_fd, connection_t *conn) {
  * another request, or now waiting on EPOLLOUT). */
 static bool send_response(int epoll_fd, connection_t *conn) {
     bool closed = false;
-    bool done = try_flush_write_buffer(conn, &closed);
+    bool done = try_flush_response(conn, &closed);
     if (closed) {
         close_connection(conn);
         return false;
@@ -261,6 +435,56 @@ static void stash_pending_input(connection_t *conn, const char *data, size_t len
     conn->pending_input_len = len;
 }
 
+/* Adopts whatever the two builders produced, refusing a truncated one.
+ * snprintf() reports the length the response *would* have needed, so a
+ * value at or past the buffer size means bytes were dropped; taking it
+ * as the length anyway would make write() read past write_buf. Every
+ * response this server builds fits comfortably, so a failure here is a
+ * bug (a new header, a longer reason phrase), not something a client can
+ * trigger. Returns false so the caller can fall back to a fixed 500. */
+static bool set_write_buffer(connection_t *conn, int written) {
+    if (written < 0 || (size_t)written >= sizeof(conn->write_buf)) {
+        return false;
+    }
+    conn->write_len = (size_t)written;
+    conn->write_sent = 0;
+    return true;
+}
+
+/* Fills conn->write_buf with the response for r and takes ownership of
+ * r->file if it has one. */
+static void prepare_response(connection_t *conn, const routed_response_t *r, bool keep_alive) {
+    static const char internal_error[] = "HTTP/1.1 500 Internal Server Error\r\n"
+                                         "Content-Type: text/plain\r\n"
+                                         "Content-Length: 21\r\n"
+                                         "Connection: close\r\n"
+                                         "\r\n"
+                                         "Internal Server Error";
+
+    conn->keep_alive_after_write = keep_alive;
+
+    const char *connection_value = keep_alive ? "keep-alive" : "close";
+    int written = (r->file.fd >= 0) ? build_file_response_head(conn->write_buf, sizeof(conn->write_buf), r, connection_value)
+                                    : build_response(conn->write_buf, sizeof(conn->write_buf), r, connection_value);
+
+    if (!set_write_buffer(conn, written)) {
+        fprintf(stderr, "response did not fit in %zu bytes, answering 500\n", sizeof(conn->write_buf));
+        static_file_t file = r->file;
+        static_file_close(&file);
+        memcpy(conn->write_buf, internal_error, sizeof(internal_error) - 1);
+        conn->write_len = sizeof(internal_error) - 1;
+        conn->write_sent = 0;
+        conn->keep_alive_after_write = false;
+        return;
+    }
+
+    if (r->file.fd >= 0) {
+        conn->file_fd = r->file.fd;
+        conn->file_offset = 0;
+        conn->file_size = r->file.size;
+    }
+}
+
 /* Parses and responds to as many complete requests as are present in
  * [data, data+len), stopping early the moment a response can't be
  * flushed synchronously (send_response already arranged EPOLLOUT and
@@ -280,9 +504,8 @@ static bool process_input(int epoll_fd, connection_t *conn, const char *data, si
         }
 
         bool malformed = (result == HTTP_PARSE_ERROR);
-        routed_response_t r = malformed
-            ? (routed_response_t){.status = 400, .reason = "Bad Request", .body = "Bad Request", .extra_header = NULL}
-            : route_request(&conn->parser);
+        routed_response_t r =
+            malformed ? simple_response(400, "Bad Request", "Bad Request", NULL) : route_request(&conn->parser);
         /* A parse error means the request framing itself is broken, we
          * genuinely don't know where this "request" ends in the byte
          * stream, so there is no safe way to keep treating this
@@ -290,10 +513,7 @@ static bool process_input(int epoll_fd, connection_t *conn, const char *data, si
          * that made it through before things went wrong. */
         bool keep_alive = malformed ? false : http_parser_should_keep_alive(&conn->parser);
 
-        conn->keep_alive_after_write = keep_alive;
-        conn->write_len = (size_t)build_response(conn->write_buf, sizeof(conn->write_buf), r.status, r.reason, r.body,
-                                                  r.extra_header, keep_alive ? "keep-alive" : "close");
-        conn->write_sent = 0;
+        prepare_response(conn, &r, keep_alive);
 
         if (!send_response(epoll_fd, conn)) {
             return false;
@@ -354,10 +574,12 @@ static void handle_client_readable(int epoll_fd, connection_t *conn) {
     }
 }
 
-/* EPOLLOUT handler: resumes a response write that previously blocked. */
+/* EPOLLOUT handler: resumes a response write that previously blocked,
+ * whether it stalled in the buffered head or partway through the file
+ * body. */
 static void flush_pending_write(int epoll_fd, connection_t *conn) {
     bool closed = false;
-    bool done = try_flush_write_buffer(conn, &closed);
+    bool done = try_flush_response(conn, &closed);
     if (closed) {
         close_connection(conn);
         return;
@@ -418,6 +640,7 @@ static void accept_new_connections(int epoll_fd, int listen_fd) {
         }
         memset(conn, 0, sizeof(*conn));
         conn->fd = conn_fd;
+        conn->file_fd = -1; /* must follow the memset, see the field's declaration */
         http_parser_init(&conn->parser);
         conn->last_activity = time(NULL);
 

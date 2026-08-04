@@ -1,0 +1,15 @@
+/* Existe sobretudo para exercitar dois caminhos nos testes: um arquivo em
+   subdiretorio e um Content-Type que nao e text/plain nem text/html. */
+
+body {
+    max-width: 40rem;
+    margin: 3rem auto;
+    padding: 0 1rem;
+    font-family: system-ui, sans-serif;
+    line-height: 1.6;
+}
+
+code {
+    background: #f0f0f0;
+    padding: 0.1rem 0.3rem;
+}

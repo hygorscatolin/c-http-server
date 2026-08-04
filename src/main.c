@@ -1,13 +1,21 @@
 #include <arpa/inet.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include "event_loop.h"
+#include "static_files.h"
 
 #define PORT 8080
 #define BACKLOG 128 /* completed connections queued for accept(); does not bound in-flight SYNs */
+
+/* Relative to the working directory, so the server is expected to run
+ * from the repository root. Overridable mainly so the integration tests
+ * can serve a scratch directory they're free to fill with oversized and
+ * deliberately hostile files, see tests/test_static_files.py. */
+#define DEFAULT_PUBLIC_ROOT "public"
 
 /* Slowloris opens many connections and either sends nothing at all or
  * trickles a request a few bytes at a time, never completing it, tying
@@ -83,10 +91,33 @@ static int create_listen_socket(void) {
 }
 
 int main(void) {
+    /* Writing to a socket whose peer has gone away raises SIGPIPE, whose
+     * default action is to kill the process: one client closing its
+     * browser tab mid-download would take the whole server down. send()
+     * could opt out per call with MSG_NOSIGNAL, but sendfile(2) has no
+     * equivalent flag, so ignoring the signal process-wide is the only
+     * option. The write then fails with EPIPE, which the event loop
+     * already handles like any other fatal write error. */
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        perror("signal(SIGPIPE)");
+        return EXIT_FAILURE;
+    }
+
+    /* Resolved once, up front: a document root that doesn't exist is a
+     * misconfiguration worth failing on immediately, not something to
+     * discover as a puzzling 404 on every request later. */
+    const char *public_root = getenv("HTTP_SERVER_PUBLIC_ROOT");
+    if (public_root == NULL || public_root[0] == '\0') {
+        public_root = DEFAULT_PUBLIC_ROOT;
+    }
+    if (static_files_init(public_root) < 0) {
+        return EXIT_FAILURE;
+    }
+
     int listen_fd = create_listen_socket();
     int idle_timeout_seconds = idle_timeout_from_env();
-    printf("Servidor escutando na porta %d (epoll, edge-triggered, keep-alive, idle timeout %ds)...\n", PORT,
-           idle_timeout_seconds);
+    printf("Servidor escutando na porta %d (epoll, edge-triggered, keep-alive, idle timeout %ds, estáticos de '%s')...\n",
+           PORT, idle_timeout_seconds, public_root);
 
     int status = event_loop_run(listen_fd, idle_timeout_seconds);
 
