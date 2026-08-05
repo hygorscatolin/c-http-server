@@ -6,6 +6,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>  /* IPPROTO_TCP */
+#include <netinet/tcp.h> /* TCP_NODELAY, see set_tcp_nodelay */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -135,6 +137,65 @@ static int set_nonblocking(int fd) {
         return -1;
     }
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/* Disables Nagle's algorithm (RFC 896) on an accepted connection.
+ *
+ * Found by measurement, not by reading: scripts/benchmark.sh reported
+ * every static file response taking a flat ~44ms regardless of load (22
+ * req/s at one connection, 4457 req/s at 200, the same 44ms latency in
+ * both), while the in-memory route on the same server answered in about
+ * 1ms. A constant that neither grows with concurrency nor shrinks with
+ * idleness is a timer, not contention, and ~40ms is the Linux delayed
+ * ACK timer.
+ *
+ * The two algorithms meet like this. A file response leaves in two
+ * pieces: write() puts the header out, then sendfile() sends the body
+ * (see try_flush_response). The header is a small segment, so once it is
+ * in flight Nagle refuses to send the next small segment until that one
+ * is acknowledged, which is exactly what it is for: it stops a stream of
+ * tiny writes from becoming a stream of tiny packets. Meanwhile the
+ * client has just sent its request and has nothing to say, so delayed
+ * ACK (RFC 1122 section 4.2.3.2) holds the acknowledgement back for up
+ * to 40ms hoping to piggyback it on data of its own. Neither side is
+ * wrong and neither is going to move first, so every response waits out
+ * the timer. The in-memory routes never showed it because their whole
+ * response, headers and body, is a single write().
+ *
+ * TCP_NODELAY is the standard answer for an HTTP server, and it is worth
+ * being precise about why rather than treating it as a magic incantation.
+ * Nagle's heuristic exists because the application has not told the
+ * kernel where its messages end, so the kernel guesses from write sizes
+ * and timing. In a request/response protocol that guess is simply wrong:
+ * the server writes one complete, self-delimiting message and then stops
+ * to wait for the peer, so there is never a following small write to
+ * coalesce with, and holding the last segment can only ever add latency.
+ * Every general purpose server sets it for that reason (nginx, Apache,
+ * Go's net/http, and most others do it unconditionally on accept).
+ *
+ * The alternative would be MSG_MORE on the header write, which tells the
+ * kernel "more data follows, hold this segment", the honest way to say
+ * what Nagle was guessing. It coalesces header and body into one segment
+ * rather than merely refusing to delay, so it is strictly better on this
+ * one path, but it has to be threaded through every place a response is
+ * written and gets silently wrong the moment a path forgets it. Turning
+ * the heuristic off once, per socket, at the only place sockets are
+ * created, cannot rot in the same way. The cost of TCP_NODELAY is that a
+ * response written in several small pieces goes out as several small
+ * packets, which is bounded here: one write() plus one sendfile(),
+ * never a per-chunk trickle.
+ *
+ * Set on the accepted socket rather than on the listener because whether
+ * an accepted socket inherits it is platform-specific, and doing it here
+ * keeps it next to the write path it exists to serve. Failure is logged
+ * and ignored: the connection is still perfectly correct without it,
+ * only slower, and refusing to serve a client over a latency
+ * optimization would be the worse trade. */
+static void set_tcp_nodelay(int fd) {
+    int nodelay = 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) < 0) {
+        perror("setsockopt(TCP_NODELAY)");
+    }
 }
 
 static void list_insert(event_loop_t *loop, connection_t *conn) {
@@ -670,6 +731,8 @@ static void accept_new_connections(event_loop_t *loop) {
             perror("accept4");
             return;
         }
+
+        set_tcp_nodelay(conn_fd);
 
         connection_t *conn = malloc(sizeof(*conn));
         if (conn == NULL) {

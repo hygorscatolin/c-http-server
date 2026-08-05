@@ -17,3 +17,11 @@ server
 test_http_parser
 test_static_files
 __pycache__/
+
+# Binário de release e fixture de benchmark. Os resultados em
+# benchmarks/results/ NÃO são ignorados: são texto de alguns KB e servem
+# como registro histórico (ver COMPARISON.md). O arquivo grande é
+# gerado pelo script, 8MiB de bytes aleatórios não têm por que entrar
+# no histórico do git.
+http-server-release
+public/benchmark-large.bin

@@ -1,0 +1,17 @@
+benchmark 20260804-153317  (10s per run, 8 cpus, one worker per cpu)
+
+SCENARIO     PATH                    CONN  THR        REQ/S        MB/S     AVG ms     P50 ms     P99 ms  ERRORS
+inline       /                          1    1         4633         0.6       1.05       0.15      12.85  -
+inline       /                         10    4        29254         3.5       1.16       0.16      17.68  -
+inline       /                         50    4       112503        13.4       0.91       0.21      12.19  -
+inline       /                        200    4       140086        16.7       1.78       0.65      14.70  -
+small-file   /hello.txt                 1    1           22         0.0      44.64      44.00      48.12  -
+small-file   /hello.txt                10    4          179         0.1      44.62      44.01      48.24  -
+small-file   /hello.txt                50    4         1066         0.4      44.89      44.01      55.99  -
+small-file   /hello.txt               200    4         4457         1.7      44.63      43.91      56.11  -
+large-file   /benchmark-large.bin       1    1          229      1833.0       4.53       3.79      14.86  -
+large-file   /benchmark-large.bin      10    4          781      6246.4       8.51       7.88      28.36  -
+large-file   /benchmark-large.bin      50    4          515      4126.7      63.73      51.15     214.82  -
+large-file   /benchmark-large.bin     200    4          627      5027.8     250.81     179.41     963.73  -
+
+raw wrk output and environment.txt: benchmarks/results/20260804-153317/

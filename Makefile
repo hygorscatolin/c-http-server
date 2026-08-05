@@ -18,9 +18,41 @@ CC = gcc
 CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -O1 -g -fsanitize=address,undefined -pthread -Isrc
 LDFLAGS = -fsanitize=address,undefined -pthread
 
+# The build for measuring, and only for measuring. Same warning set (a
+# release that compiles with fewer checks than the debug build is a
+# release nobody has actually checked), same -pthread, no sanitizers,
+# -O2 instead of -O1.
+#
+# Sanitizers come out because with them in, a benchmark measures the
+# instrumentation rather than the server. AddressSanitizer checks every
+# load and store against its shadow memory, which alone tends to cost
+# around 2x CPU and 3x RSS, and it replaces malloc with an allocator that
+# adds redzones and a quarantine, so freed memory is not reused promptly:
+# this server malloc/frees one connection_t per accepted connection, so
+# that is squarely on the hot path. UndefinedBehaviorSanitizer adds a
+# branch to arithmetic and to every pointer it can. None of that is
+# uniform overhead, it is heavier exactly where the code does the most
+# work, which distorts the comparison *between* scenarios and not just
+# the absolute numbers. Sanitizer figures would say more about GCC than
+# about epoll or sendfile.
+#
+# What comes out with them is all the memory-error detection, so this
+# binary is not the one to trust for correctness: every test target above
+# deliberately keeps running against the instrumented $(BIN). That is
+# also why this is a separate output file rather than a flag toggle on
+# the same one, the two can coexist and a stale uninstrumented binary can
+# never be silently handed to the test suite.
+#
+# -O2 is what you would actually ship, and the level whose extra
+# data-flow analysis surfaces warnings -O1 does not reach, so building
+# this target is a small static-analysis pass in its own right.
+RELEASE_CFLAGS = -std=c11 -Wall -Wextra -Wpedantic -O2 -pthread -Isrc
+RELEASE_LDFLAGS = -pthread
+
 SRC = src/main.c src/event_loop.c src/http_parser.c src/static_files.c src/worker_pool.c
 HDR = src/event_loop.h src/http_parser.h src/static_files.h src/worker_pool.h
 BIN = http-server
+RELEASE_BIN = http-server-release
 
 PARSER_TEST_SRC = tests/test_http_parser.c src/http_parser.c
 PARSER_TEST_BIN = test_http_parser
@@ -28,12 +60,17 @@ PARSER_TEST_BIN = test_http_parser
 STATIC_TEST_SRC = tests/test_static_files.c src/static_files.c
 STATIC_TEST_BIN = test_static_files
 
-.PHONY: all run test test-keepalive test-static test-threads test-all clean
+.PHONY: all release run test test-keepalive test-static test-threads test-all benchmark clean
 
 all: $(BIN)
 
 $(BIN): $(SRC) $(HDR)
 	$(CC) $(CFLAGS) -o $(BIN) $(SRC) $(LDFLAGS)
+
+release: $(RELEASE_BIN)
+
+$(RELEASE_BIN): $(SRC) $(HDR)
+	$(CC) $(RELEASE_CFLAGS) -o $(RELEASE_BIN) $(SRC) $(RELEASE_LDFLAGS)
 
 run: all
 	./$(BIN)
@@ -68,5 +105,11 @@ test-threads: all
 
 test-all: test test-keepalive test-static test-threads
 
+# Builds the release binary itself, so `make benchmark` on a clean tree
+# is enough. Everything else about the run (scenarios, durations, where
+# the numbers land) is in the script.
+benchmark:
+	./scripts/benchmark.sh
+
 clean:
-	rm -f $(BIN) $(PARSER_TEST_BIN) $(STATIC_TEST_BIN)
+	rm -f $(BIN) $(RELEASE_BIN) $(PARSER_TEST_BIN) $(STATIC_TEST_BIN)

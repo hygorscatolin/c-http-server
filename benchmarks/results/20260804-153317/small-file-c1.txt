@@ -1,0 +1,13 @@
+Running 10s test @ http://127.0.0.1:8080/hello.txt
+  1 threads and 1 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency    44.64ms    4.70ms  84.86ms   98.65%
+    Req/Sec    22.30      4.46    30.00     75.00%
+  Latency Distribution
+     50%   44.00ms
+     75%   44.07ms
+     90%   47.97ms
+     99%   48.12ms
+  223 requests in 10.00s, 84.83KB read
+Requests/sec:     22.30
+Transfer/sec:      8.48KB

@@ -1,0 +1,11 @@
+timestamp:      20260804-153317
+git commit:     8547061
+git dirty:      yes
+host:           Linux 6.18.33.2-microsoft-standard-WSL2 x86_64
+cpus online:    8
+compiler:       gcc (Ubuntu 15.2.0-16ubuntu1) 15.2.0
+release cflags: -std=c11 -Wall -Wextra -Wpedantic -O2 -pthread -Isrc
+wrk:            wrk debian/4.1.0-4build3 [epoll] Copyright (C) 2012 Will Glozer
+duration:       10s per run
+big file:       8MiB
+server banner:  Servidor escutando na porta 8080 (8 thread(s) via SO_REUSEPORT, epoll edge-triggered, keep-alive, idle timeout 30s, estáticos de 'public')...
