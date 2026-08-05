@@ -1,0 +1,17 @@
+server	scenario	conn	req_per_sec	avg_ms	p99_ms	transfer
+mine	small-file	1	4800.82	417.25us	5.91ms	1.78MB
+nginx	small-file	1	5147.79	220.38us	733.00us	2.55MB
+mine	small-file	10	26035.20	0.91ms	16.12ms	9.66MB
+nginx	small-file	10	15330.78	2.51ms	35.45ms	7.59MB
+mine	small-file	50	70273.46	0.96ms	7.30ms	26.07MB
+nginx	small-file	50	60026.06	7.76ms	182.58ms	29.71MB
+mine	small-file	200	79371.23	2.78ms	18.63ms	29.45MB
+nginx	small-file	200	47613.00	19.43ms	468.26ms	23.57MB
+mine	large-file	1	207.12	5.12ms	16.31ms	1.62GB
+nginx	large-file	1	254.27	3.99ms	10.40ms	1.99GB
+mine	large-file	10	906.87	7.31ms	20.92ms	7.09GB
+nginx	large-file	10	971.58	6.82ms	14.20ms	7.59GB
+mine	large-file	50	942.90	32.40ms	111.25ms	7.37GB
+nginx	large-file	50	901.50	32.04ms	89.22ms	7.04GB
+mine	large-file	200	685.25	219.98ms	800.43ms	5.38GB
+nginx	large-file	200	740.64	172.45ms	764.08ms	5.80GB

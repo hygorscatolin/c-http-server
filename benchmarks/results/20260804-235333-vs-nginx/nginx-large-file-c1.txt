@@ -1,0 +1,13 @@
+Running 10s test @ http://127.0.0.1:8081/benchmark-large.bin
+  1 threads and 1 connections
+  Thread Stats   Avg      Stdev     Max   +/- Stdev
+    Latency     3.99ms    1.29ms  21.77ms   93.35%
+    Req/Sec   255.31     39.28   294.00     86.87%
+  Latency Distribution
+     50%    3.62ms
+     75%    4.03ms
+     90%    4.81ms
+     99%   10.40ms
+  2556 requests in 10.05s, 19.97GB read
+Requests/sec:    254.27
+Transfer/sec:      1.99GB
